@@ -52,6 +52,20 @@ the yankpad:
      replaced with the digit matched by the regex. So if I write "number12" and
      use "yankpad-expand" the "percent s" will be replaced with 12.
 
+  ,** attendees: Meeting attendees
+
+     Attendees: <people>
+
+     ,#+ATTR_YANKPAD: :completion people :sep ", "
+     - Alice
+     - Bob
+     - Carol
+
+     The list under the =#+ATTR_YANKPAD= keyword is used as completion
+     candidates when the snippet is inserted.  The selected values replace
+     =<people>= in the snippet text, separated by the string in =:sep=.  See
+     /Completing-read lists/ below.
+
   ,* Category 2
 
     Descriptive lists will be treated as snippets. You can set them to be treated
@@ -283,12 +297,47 @@ You could add your own special properties using =yankpad-before-snippet-hook=. T
 (add-hook 'yankpad-before-snippet-hook 'yp/upcase-snippet)
 #+END_SRC
 
+* Completing-read lists
+
+A snippet can contain a list of values to choose from.  Put a =#+ATTR_YANKPAD=
+keyword directly above the list, and refer to the list by name in the snippet
+text using =<name>=:
+
+#+BEGIN_SRC org
+  ,** attendees: Meeting attendees
+  Attendees: <people>
+
+  ,#+ATTR_YANKPAD: :completion people :sep ", "
+  - Alice
+  - Bob :: Project lead
+  - Carol
+#+END_SRC
+
+When the snippet is inserted, =completing-read-multiple= asks for one or more
+values.  The selected values replace =<people>=, joined by the string in
+=:sep=.  The keyword and the list are removed from the inserted text.  Items
+written as =- value :: description= show the description as an annotation in
+the completion interface.  If nothing is selected, the placeholder is replaced
+by an empty string.
+
+- =:completion NAME= :: The name of the placeholder (=<NAME>= in the snippet text).  Required.
+- =:sep STRING= :: Inserted between the selected values.  Defaults to =yankpad-completing-read-separator= (=", "=).
+- =:require-match t= :: Only allow values from the list.  By default arbitrary text can be entered as well.  Yankpad verifies the selection itself, so this holds even if your completion interface normally lets you enter arbitrary text.  See also =yankpad-completing-read-require-match=.
+
+Several lists can be used in the same snippet, each with its own keyword.  The
+keyword must be placed directly above its list.  A snippet can be inserted from
+any of the usual commands (=yankpad-insert=, =yankpad-expand=, =yankpad-capf=,
+=yankpad-map= and =yankpad-repeat=), and the values are asked for each time.
+Nothing is asked when the snippet is only shown as documentation in the
+completion interface.
+
 * Integration with =abbrev-mode=
 
 If you set =yankpad-descriptive-list-treatment= to ='abbrev=, descriptive lists inside =yankpad= categories will be handled by =abbrev-mode= instead of being considered as snippets.
 
 * Changelog
 
+- 2.60 (November 2026) :: Added completing-read lists.  A snippet can contain a list of values to choose from, using the =#+ATTR_YANKPAD= keyword.  See "Completing-read lists".
 - 2.50 (May 2026) :: Changed the caching mechanisms to make yankpad snappier. Thanks [[https://github.com/isamert][isamert]]! Make sure to run =yankpad-reload= after editing your =yankpad-file=. See the end of the example =yankpad-file= in the beginning of this README on how to reload the file automatically upon saving.
 - 2.41 (March 2025) :: Remove =company-yankpad= in favor =yankpad-capf=, to support =completion-at-point=.
 - 2.40 (September 2024) :: Add support for =project.el= categories.

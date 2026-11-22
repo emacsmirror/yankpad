@@ -5,7 +5,7 @@
 
 ;; Author: Erik Sjöstrand
 ;; URL: http://github.com/Kungsgeten/yankpad
-;; Version: 2.50
+;; Version: 2.60
 ;; Keywords: abbrev convenience
 ;; Package-Requires: ((emacs "25.1"))
 
@@ -59,6 +59,12 @@
 ;; descriptive lists to use `abbrev-mode' by setting the variable to 'abbrev
 ;; instead.
 ;;
+;; Snippets can also contain a list of values to choose from with
+;; `completing-read'.  Place a `#+ATTR_YANKPAD' keyword directly above the list
+;; and use <name> in the snippet text to mark where the selected values should
+;; be inserted.  Items written as "- value :: description" show the description
+;; as an annotation in the completion interface.
+;;
 ;; For further customization, please see the Github page: https://github.com/Kungsgeten/yankpad
 ;;
 ;; Here's an example of what yankpad.org could look like:
@@ -80,6 +86,15 @@
 ;;    If yanking a snippet into org-mode, this will respect the
 ;;    current tree level by default.  Set the variable
 ;;    `yankpad-respect-current-org-level' to nil in order to change that.
+;;
+;; ** attendees: Meeting attendees
+;;
+;;    Attendees: <people>
+;;
+;;    #+ATTR_YANKPAD: :completion people :sep ", "
+;;    - Alice
+;;    - Bob
+;;    - Carol
 ;;
 ;; * Category 2
 ;;
@@ -236,6 +251,23 @@ snippets."
   :type 'boolean
   :group 'yankpad)
 
+(defcustom yankpad-completing-read-separator ", "
+  "String inserted between values selected from a `completing-read' list.
+This can be overridden per list with the `:sep' attribute of the
+`#+ATTR_YANKPAD' keyword."
+  :type 'string
+  :group 'yankpad)
+
+(defcustom yankpad-completing-read-require-match nil
+  "Whether values chosen from a `completing-read' list must be in the list.
+When nil, arbitrary text can be entered in addition to the items in
+the list.  Yankpad validates the selection itself, so this is
+enforced even if the completion interface would allow arbitrary
+input.  This can be overridden per list with the
+`:require-match' attribute of the `#+ATTR_YANKPAD' keyword."
+  :type 'boolean
+  :group 'yankpad)
+
 (defcustom yankpad-exclude-buffers-regexp "^\\*.+\\*$"
   "Regexp to check against buffer names to disable loading of yankpad snippets.
 Buffers with matching names will not load yankpad snippets.
@@ -356,14 +388,158 @@ Uses `yankpad-category', and prompts for it if it isn't set."
         (yankpad-set-category)))
   (yankpad-insert-from-current-category))
 
-(defun yankpad-snippet-text (snippet)
+(defun yankpad--completing-read-content-p (content)
+  "Return non-nil if CONTENT has a `completing-read' list."
+  (and (stringp content)
+       (let ((case-fold-search t))
+         (string-match-p "^[ \t]*#\\+ATTR_YANKPAD:.*:completion" content))))
+
+(defun yankpad--completing-read-attr-plist (attr)
+  "Parse the value ATTR of a `#+ATTR_YANKPAD' keyword as a plist."
+  (when (listp attr)
+    (setq attr (car attr)))
+  (when (and (stringp attr)
+             (not (string-empty-p (string-trim attr))))
+    (ignore-errors
+      (car (read-from-string (concat "(" attr ")"))))))
+
+(defun yankpad--completing-read-candidates (list)
+  "Return the candidates of the org LIST as (VALUE . ANNOTATION) pairs.
+Descriptive items provide an annotation in addition to their value."
+  (org-element-map
+      list 'item
+    (lambda (item)
+      (when (eq (org-element-property :parent item) list)
+        (let* ((tag (car (org-element-property :tag item)))
+               (contents (when-let* ((beg (org-element-property :contents-begin item))
+                                     (end (org-element-property :contents-end item)))
+                           (string-trim
+                            (buffer-substring-no-properties beg end))))
+               (value (if tag (substring-no-properties tag) contents)))
+          (when (and value (not (string-empty-p value)))
+            (cons value (and tag contents))))))))
+
+(defun yankpad--completing-read-group (list)
+  "Return a `completing-read' group for the org LIST, or nil.
+The group is a plist with :name, :separator, :require-match,
+:candidates, :begin and :end."
+  (when-let* ((plist (yankpad--completing-read-attr-plist
+                      (org-element-property :attr_yankpad list)))
+              (name (plist-get plist :completion)))
+    (list :name (if (symbolp name)
+                    (symbol-name name)
+                  (format "%s" name))
+          :separator (if (plist-member plist :sep)
+                         (plist-get plist :sep)
+                       yankpad-completing-read-separator)
+          :require-match (if (plist-member plist :require-match)
+                             (plist-get plist :require-match)
+                           yankpad-completing-read-require-match)
+          :candidates (yankpad--completing-read-candidates list)
+          :begin (org-element-property :begin list)
+          :end (org-element-property :end list))))
+
+(defun yankpad--completing-read-template (content)
+  "Split CONTENT into a template and `completing-read' groups.
+Return a cons (TEMPLATE . GROUPS).  The `#+ATTR_YANKPAD' keyword and
+the list of each group are removed from TEMPLATE.  See
+`yankpad--completing-read-group' for the contents of a group."
+  (with-temp-buffer
+    (delay-mode-hooks
+      (org-mode)
+      (insert content)
+      (let* ((data (org-element-parse-buffer))
+             (groups (delq nil
+                           (org-element-map data 'plain-list
+                             #'yankpad--completing-read-group))))
+        (when groups
+          (dolist (group (reverse groups))
+            (delete-region (plist-get group :begin)
+                           (plist-get group :end)))
+          (goto-char (point-max))
+          (when (re-search-backward "\n\n+\\'" nil t)
+            (delete-region (1+ (match-beginning 0)) (point-max)))
+          (when (= (plist-get (car groups) :begin) 1)
+            (goto-char (point-min))
+            (while (looking-at "[ \t]*\n")
+              (delete-region (point) (match-end 0)))))
+        (cons (buffer-string) groups)))))
+
+(defun yankpad--completing-read-select (group)
+  "Prompt for one or more values from GROUP.
+Return the selected values as a string, joined by the group's separator.
+If GROUP has :require-match, values that are not in the list are not
+accepted, even if the completion interface itself would allow them."
+  (let* ((candidates (plist-get group :candidates))
+         (values (mapcar #'car candidates))
+         (annotated (cl-remove-if-not #'cdr candidates))
+         (require-match (plist-get group :require-match))
+         (name (plist-get group :name))
+         (collection
+          (if annotated
+              (lambda (string pred action)
+                (if (eq action 'metadata)
+                    (list 'metadata
+                          (cons 'annotation-function
+                                (lambda (candidate)
+                                  (when-let ((annotation
+                                              (cdr (assoc candidate annotated))))
+                                    (concat " " annotation)))))
+                  (complete-with-action action values string pred)))
+            values))
+         (initial nil)
+         selected invalid)
+    (while (progn
+             (setq selected
+                   (minibuffer-with-setup-hook
+                       (lambda ()
+                         ;; `completing-read-multiple' doesn't set this itself,
+                         ;; but completion interfaces (such as Vertico) use it
+                         ;; to enforce `require-match'.
+                         (set (make-local-variable 'minibuffer--require-match)
+                              require-match))
+                     (completing-read-multiple
+                      (format "%s%s: " name
+                              (if invalid
+                                  (format " (not in list: %s)"
+                                          (mapconcat #'identity invalid ", "))
+                                ""))
+                      collection nil require-match initial)))
+             (setq invalid (and require-match
+                                (cl-remove-if (lambda (value)
+                                                (member value values))
+                                              selected)))
+             (setq initial (and invalid
+                                (mapconcat #'identity selected ", ")))
+             invalid))
+    (mapconcat #'identity (delete-dups selected)
+               (plist-get group :separator))))
+
+(defun yankpad--completing-read-substitute (content)
+  "Prompt for the `completing-read' groups in CONTENT and substitute them.
+Groups whose placeholder is missing from the template are not asked for."
+  (let* ((template-groups (yankpad--completing-read-template content))
+         (template (car template-groups)))
+    (dolist (group (cdr template-groups) template)
+      (let* ((placeholder (concat "<" (regexp-quote (plist-get group :name)) ">"))
+             (value (when (string-match-p placeholder template)
+                      (yankpad--completing-read-select group))))
+        (when value
+          (setq template
+                (replace-regexp-in-string
+                 placeholder (lambda (_) value) template)))))))
+
+(defun yankpad-snippet-text (snippet &optional no-prompt)
   "Get text from SNIPPET, as a string.
 SNIPPET can be a list: Yankpad's internal representation of
-snippets. It can also be a string, in which case it should match
-a snippet name in the current category."
+snippets.  It can also be a string, in which case it should match
+a snippet name in the current category.
+
+If NO-PROMPT is non-nil, values from `completing-read' lists are not
+asked for; the placeholders are left as they are instead."
   (if (stringp snippet)
       (if-let ((real-snippet (assoc snippet (yankpad-active-snippets))))
-          (yankpad-snippet-text real-snippet)
+          (yankpad-snippet-text real-snippet no-prompt)
         (error (concat "No snippet named " snippet)))
     (let ((snippet (copy-sequence snippet)))
       (let ((name (car snippet))
@@ -379,11 +555,16 @@ a snippet name in the current category."
                    (lambda (x)
                      (org-remove-indentation (org-element-property :value x)))
                    src-blocks "")
-                  "\n"))))
+                  "\n"))
+           no-prompt))
          ((or (member "func" tags)
               (member "results" tags))
           (yankpad--trigger-snippet-function name content))
          (t
+          (when (yankpad--completing-read-content-p content)
+            (setq content (if no-prompt
+                              (car (yankpad--completing-read-template content))
+                            (yankpad--completing-read-substitute content))))
           (if (string-empty-p content)
               (message (concat "\"" name "\" snippet doesn't contain any text. Check your yankpad file."))
             ;; Respect the tree level when yanking org-mode headings.
@@ -866,11 +1047,27 @@ Each element is (KEY . DESCRIPTION), both strings."
         (with-current-buffer (get-buffer-create "*Yankpad Doc*")
           (erase-buffer)
           (insert (format "Snippet: %s\n\n" (car snippet)))
-          (let ((snippet-text (yankpad-snippet-text snippet)))
+          (let ((snippet-text (yankpad-snippet-text snippet t)))
             (when snippet-text
               (insert "Content:\n")
               (insert snippet-text)
               (insert "\n\n")))
+          (when (and (nth 3 snippet)
+                     (yankpad--completing-read-content-p (nth 3 snippet)))
+            (let ((groups (cdr (yankpad--completing-read-template (nth 3 snippet)))))
+              (when groups
+                (insert "Completing-read choices:\n")
+                (dolist (group groups)
+                  (insert (format "- %s (separator %S):\n"
+                                  (plist-get group :name)
+                                  (plist-get group :separator)))
+                  (dolist (choice (plist-get group :candidates))
+                    (insert (format "  - %s%s\n"
+                                    (car choice)
+                                    (if (cdr choice)
+                                        (format " (%s)" (cdr choice))
+                                      "")))))
+                (insert "\n"))))
           (when (> (length snippet) 1)
             (insert "Additional details:\n")
             (dolist (detail (cdr snippet))
